@@ -5,21 +5,15 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from dataclasses import dataclass
-from typing import Iterable, List
+from collections import OrderedDict
+from typing import List, Optional, Tuple
 
 DEFAULT_HISTORY_FILE = (
     r"C:\Users\deep\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\History"
 )
 CHROME_EPOCH_OFFSET_SECONDS = 11644473600
 
-
-@dataclass(frozen=True)
-class HistoryEntry:
-    url: str
-    title: str
-    visit_count: int
-    last_visit_time: int
+VisitRow = Tuple[int, str, str]  # (chrome visit_time, url, title)
 
 
 def chrome_timestamp_to_datetime(chrome_timestamp: int) -> datetime.datetime | None:
@@ -57,45 +51,35 @@ def _copy_history_to_temp(history_file: str) -> str:
     return temp_path
 
 
-def fetch_history(history_file: str) -> List[HistoryEntry]:
-    temp_copy = _copy_history_to_temp(history_file)
+def count_visits(history_file: str) -> int:
+    conn = sqlite3.connect(history_file)
     try:
-        conn = sqlite3.connect(temp_copy)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM visits")
+        return int(cursor.fetchone()[0])
+    finally:
+        conn.close()
+
+
+def fetch_visit_chunk(history_file: str, offset: int, limit: int) -> List[VisitRow]:
+    """Fetch a page of visits (most recent first) joined with their URL/title."""
+    conn = sqlite3.connect(history_file)
+    try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT url, title, visit_count, last_visit_time "
-            "FROM urls ORDER BY last_visit_time DESC"
+            "SELECT v.visit_time, u.url, COALESCE(u.title, '') "
+            "FROM visits v JOIN urls u ON u.id = v.url "
+            "ORDER BY v.visit_time DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         )
-        rows = cursor.fetchall()
-        conn.close()
-        return [HistoryEntry(*row) for row in rows]
+        return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
     finally:
-        os.unlink(temp_copy)
+        conn.close()
 
 
-def build_table_rows(
-    entries: Iterable[HistoryEntry],
-) -> List[tuple[str, str, str, str, str, str]]:
-    return [
-        (
-            display_time_only(entry.last_visit_time),
-            entry.title or "(no title)",
-            str(entry.visit_count),
-            entry.url,
-            display_timestamp(entry.last_visit_time),
-            display_date_only(entry.last_visit_time),
-        )
-        for entry in entries
-    ]
-
-
-class TitleLabel:  # runtime Qt subclass built in run_gui after Qt imports
-    pass
-
-
-def run_gui(entries: List[HistoryEntry]) -> int:
+def run_gui(history_file: str) -> int:
     try:
-        from PyQt6.QtCore import QEvent, Qt
+        from PyQt6.QtCore import QAbstractTableModel, QEvent, QModelIndex, Qt
         from PyQt6.QtGui import QDesktopServices
         from PyQt6.QtWidgets import (
             QApplication,
@@ -103,10 +87,7 @@ def run_gui(entries: List[HistoryEntry]) -> int:
             QLabel,
             QMainWindow,
             QStyledItemDelegate,
-            QStyle,
-            QStyleOptionViewItem,
-            QTableWidget,
-            QTableWidgetItem,
+            QTableView,
             QVBoxLayout,
             QWidget,
         )
@@ -114,7 +95,7 @@ def run_gui(entries: List[HistoryEntry]) -> int:
         pyqt6 = True
     except ImportError:
         try:
-            from PyQt5.QtCore import QEvent, Qt, QUrl  # type: ignore
+            from PyQt5.QtCore import QAbstractTableModel, QEvent, QModelIndex, Qt, QUrl  # type: ignore
             from PyQt5.QtGui import QDesktopServices  # type: ignore
             from PyQt5.QtWidgets import (  # type: ignore
                 QApplication,
@@ -122,10 +103,7 @@ def run_gui(entries: List[HistoryEntry]) -> int:
                 QLabel,
                 QMainWindow,
                 QStyledItemDelegate,  # type: ignore
-                QStyle,  # type: ignore
-                QStyleOptionViewItem,  # type: ignore
-                QTableWidget,
-                QTableWidgetItem,
+                QTableView,  # type: ignore
                 QVBoxLayout,
                 QWidget,
             )
@@ -135,83 +113,94 @@ def run_gui(entries: List[HistoryEntry]) -> int:
             return 1
 
     if pyqt6:
-        elide_right = Qt.TextElideMode.ElideRight
-        text_word_wrap = Qt.TextFlag.TextWordWrap
         tooltip_role = Qt.ItemDataRole.ToolTipRole
-        scroll_bar_off = Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        align_left = Qt.AlignmentFlag.AlignLeft
-        align_vcenter = Qt.AlignmentFlag.AlignVCenter
-        no_edit_triggers = QTableWidget.EditTrigger.NoEditTriggers
-        select_rows = QTableWidget.SelectionBehavior.SelectRows
-        single_selection = QTableWidget.SelectionMode.SingleSelection
         stretch_mode = QHeaderView.ResizeMode.Stretch
         resize_to_contents_mode = QHeaderView.ResizeMode.ResizeToContents
-        per_pixel_mode = QTableWidget.ScrollMode.ScrollPerPixel
+        fixed_mode = QHeaderView.ResizeMode.Fixed
+        per_pixel_mode = QTableView.ScrollMode.ScrollPerPixel
     else:
-        elide_right = Qt.ElideRight
-        text_word_wrap = Qt.TextWordWrap
         tooltip_role = Qt.ToolTipRole
-        scroll_bar_off = Qt.ScrollBarAlwaysOff
-        align_left = Qt.AlignLeft
-        align_vcenter = Qt.AlignVCenter
-        no_edit_triggers = QTableWidget.NoEditTriggers
-        select_rows = QTableWidget.SelectRows
-        single_selection = QTableWidget.SingleSelection
         stretch_mode = QHeaderView.Stretch
         resize_to_contents_mode = QHeaderView.ResizeToContents
-        per_pixel_mode = QTableWidget.ScrollPerPixel
+        fixed_mode = QHeaderView.Fixed
+        per_pixel_mode = QTableView.ScrollPerPixel
 
     url_role = Qt.ItemDataRole.UserRole if pyqt6 else Qt.UserRole
     display_role = Qt.ItemDataRole.DisplayRole if pyqt6 else Qt.DisplayRole
 
+    class LazyVisitModel(QAbstractTableModel):
+        page_size = 2000
+        max_cached_rows = 200_000
+
+        def __init__(self, db_path: str) -> None:
+            super().__init__()
+            self._db_path = db_path
+            self._total = count_visits(db_path)
+            self._max_pages = max(1, self.max_cached_rows // self.page_size)
+            self._cache: OrderedDict[int, List[VisitRow]] = OrderedDict()
+
+        # -- Qt model interface ------------------------------------------------
+        def rowCount(self, parent=QModelIndex()):  # type: ignore[override]
+            if parent.isValid():
+                return 0
+            return self._total
+
+        def columnCount(self, parent=QModelIndex()):  # type: ignore[override]
+            return 2
+
+        def headerData(self, section, orientation, role=display_role):  # type: ignore[override]
+            if (
+                orientation == (Qt.Orientation.Horizontal if pyqt6 else Qt.Horizontal)
+                and role == display_role
+            ):
+                return ["Last Visit Time", "Title"][section]
+            return None
+
+        def data(self, index, role=display_role):  # type: ignore[override]
+            if not index.isValid() or index.row() >= self._total:
+                return None
+            row = self._row(index.row())
+            chrome_time, url, title = row
+            col = index.column()
+            if role == display_role:
+                if col == 0:
+                    return display_time_only(chrome_time)
+                return title or "(no title)"
+            if role == tooltip_role:
+                if col == 0:
+                    return display_timestamp(chrome_time)
+                return f"{title}\n{url}" if title else url
+            if role == url_role and col == 1:
+                return url
+            return None
+
+        # -- helpers -----------------------------------------------------------
+        def _row(self, row: int) -> VisitRow:
+            page_idx, offset = divmod(row, self.page_size)
+            page = self._cache.get(page_idx)
+            if page is None:
+                page = self._load_page(page_idx)
+            return page[offset]
+
+        def _load_page(self, page_idx: int) -> List[VisitRow]:
+            offset = page_idx * self.page_size
+            page = fetch_visit_chunk(self._db_path, offset, self.page_size)
+            self._cache[page_idx] = page
+            while len(self._cache) > self._max_pages:
+                self._cache.popitem(last=False)
+            return page
+
+        def datetime_for_row(self, row: int) -> Optional[datetime.datetime]:
+            if not 0 <= row < self._total:
+                return None
+            return chrome_timestamp_to_datetime(self._row(row)[0])
+
+        def total_rows(self) -> int:
+            return self._total
+
     class TitleDelegate(QStyledItemDelegate):
-        expanded_row = -1
-
-        def _measure_wrap_height(self, font_metrics, text: str, width: int) -> int:
-            rect = font_metrics.boundingRect(
-                0, 0, width, 10000, text_word_wrap, text
-            )
-            return max(28, rect.height() + 10)
-
-        def sizeHint(self, option, index):  # type: ignore[override]
-            size = super().sizeHint(option, index)
-            if index.row() == self.expanded_row:
-                text = index.data(display_role) or ""
-                width = max(40, self.parent().columnWidth(1) - 6)
-                size.setHeight(
-                    self._measure_wrap_height(option.fontMetrics, text, width)
-                )
-            return size
-
         def paint(self, painter, option, index) -> None:  # type: ignore[override]
-            style_option = QStyleOptionViewItem(option)
-            self.initStyleOption(style_option, index)
-            text = index.data(display_role) or ""
-
-            painter.save()
-            painter.setClipRect(option.rect)
-            if style_option.state & QStyle.StateFlag.State_Selected:
-                painter.fillRect(option.rect, style_option.palette.highlight())
-                painter.setPen(style_option.palette.highlightedText().color())
-            else:
-                painter.setPen(style_option.palette.text().color())
-
-            if index.row() == self.expanded_row:
-                painter.drawText(
-                    option.rect.adjusted(4, 3, -4, -3),
-                    align_left | align_vcenter | text_word_wrap,
-                    text,
-                )
-            else:
-                elided = style_option.fontMetrics.elidedText(
-                    text, elide_right, max(1, option.rect.width() - 8)
-                )
-                painter.drawText(
-                    option.rect.adjusted(4, 3, -4, -3),
-                    align_left | align_vcenter,
-                    elided,
-                )
-            painter.restore()
+            super().paint(painter, option, index)
 
         def editorEvent(self, event, model, option, index):  # type: ignore[override]
             if (
@@ -228,10 +217,9 @@ def run_gui(entries: List[HistoryEntry]) -> int:
     class HistoryWindow(QMainWindow):
         collapsed_row_height = 28
 
-        def __init__(self, history_entries: List[HistoryEntry]):
+        def __init__(self, model: LazyVisitModel):
             super().__init__()
-            self.entries = history_entries
-            self.expanded_row = -1
+            self.model = model
             self.setWindowTitle("Brave History Viewer")
             self.resize(1100, 700)
 
@@ -244,106 +232,61 @@ def run_gui(entries: List[HistoryEntry]) -> int:
             self.top_date_label.setStyleSheet("font-weight: 600;")
             layout.addWidget(self.top_date_label)
 
-            self.table = QTableWidget()
-            self.table.setColumnCount(3)
-            self.table.setHorizontalHeaderLabels(["Last Visit Time", "Title", "Visit Count"])
-            self.table.setRowCount(len(self.entries))
+            self.table = QTableView()
+            self.table.setModel(model)
             self.table.setAlternatingRowColors(True)
             self.table.verticalHeader().setVisible(False)
-            self.table.setEditTriggers(no_edit_triggers)
-            self.table.setSelectionBehavior(select_rows)
-            self.table.setSelectionMode(single_selection)
-            self.table.setHorizontalScrollBarPolicy(scroll_bar_off)
+            self.table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
+            self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+            self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.table.setHorizontalScrollMode(per_pixel_mode)
             self.table.setVerticalScrollMode(per_pixel_mode)
+            self.table.verticalHeader().setDefaultSectionSize(self.collapsed_row_height)
+            self.table.verticalHeader().setSectionResizeMode(fixed_mode)
             layout.addWidget(self.table)
             self.setCentralWidget(root)
 
             self.title_delegate = TitleDelegate(self.table)
             self.table.setItemDelegateForColumn(1, self.title_delegate)
-
-            self._populate_table()
             self._configure_columns()
             self._connect_signals()
             self._update_top_date_header()
-
-        def _populate_table(self) -> None:
-            for row_idx, row_data in enumerate(build_table_rows(self.entries)):
-                time_short, title, visit_count, url, time_full, _ = row_data
-
-                time_item = QTableWidgetItem(time_short)
-                time_item.setData(tooltip_role, time_full)
-                self.table.setItem(row_idx, 0, time_item)
-
-                title_item = QTableWidgetItem(title)
-                title_item.setData(url_role, url)
-                title_item.setData(tooltip_role, f"{title}\n{url}" if url else title)
-                self.table.setItem(row_idx, 1, title_item)
-
-                count_item = QTableWidgetItem(visit_count)
-                self.table.setItem(row_idx, 2, count_item)
-                self.table.setRowHeight(row_idx, self.collapsed_row_height)
 
         def _configure_columns(self) -> None:
             header = self.table.horizontalHeader()
             header.setSectionResizeMode(0, resize_to_contents_mode)
             header.setSectionResizeMode(1, stretch_mode)
-            header.setSectionResizeMode(2, resize_to_contents_mode)
             self.table.setColumnWidth(0, max(self.table.columnWidth(0), 120))
-            self.table.setColumnWidth(2, max(self.table.columnWidth(2), 90))
 
         def _connect_signals(self) -> None:
-            self.table.cellClicked.connect(self._toggle_row)
             self.table.verticalScrollBar().valueChanged.connect(
                 lambda _: self._update_top_date_header()
             )
 
-        def _toggle_row(self, row: int, _: int) -> None:
-            if row == self.expanded_row:
-                self._set_row_expanded(row, False)
-                self.expanded_row = -1
-                self.title_delegate.expanded_row = -1
-                return
-
-            if self.expanded_row >= 0:
-                self._set_row_expanded(self.expanded_row, False)
-            self.expanded_row = row
-            self.title_delegate.expanded_row = row
-            self._set_row_expanded(row, True)
-
-        def _set_row_expanded(self, row: int, expanded: bool) -> None:
-            if expanded:
-                column_width = max(40, self.table.columnWidth(1) - 6)
-                text = self.table.item(row, 1).text()
-                height = max(
-                    self.collapsed_row_height,
-                    self.title_delegate._measure_wrap_height(
-                        self.table.fontMetrics(), text, column_width
-                    ),
-                )
-                self.table.setRowHeight(row, height)
-            else:
-                self.table.setRowHeight(row, self.collapsed_row_height)
-            self.table.viewport().update()
-
         def _update_top_date_header(self) -> None:
             row = self.table.rowAt(0)
-            if row < 0 or row >= len(self.entries):
+            dt = self.model.datetime_for_row(row) if row >= 0 else None
+            if dt is None:
                 self.top_date_label.setText("Date: UNKNOWN")
                 return
-            self.top_date_label.setText(
-                f"Date: {display_date_only(self.entries[row].last_visit_time)}"
-            )
+            self.top_date_label.setText(f"Date: {dt.strftime('%Y-%m-%d')}")
 
+    temp_path = _copy_history_to_temp(history_file)
     app = QApplication(sys.argv)
-    window = HistoryWindow(entries)
+    model = LazyVisitModel(temp_path)
+    window = HistoryWindow(model)
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        del model
+        os.unlink(temp_path)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Open Brave history in a scrollable GUI table."
+        description="Open Brave visit history in a scrollable GUI table."
     )
     parser.add_argument(
         "--history-file",
@@ -364,21 +307,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"History file not found: {args.history_file}")
         return 1
 
-    entries = fetch_history(args.history_file)
-    print(f"Loaded {len(entries)} history entries.")
-
     if args.profile:
         import cProfile
         import pstats
 
         profiler = cProfile.Profile()
         profiler.enable()
-        code = run_gui(entries)
+        code = run_gui(args.history_file)
         profiler.disable()
         stats = pstats.Stats(profiler)
         stats.sort_stats("cumulative").print_stats(30)
         return code
-    return run_gui(entries)
+    return run_gui(args.history_file)
 
 
 if __name__ == "__main__":
