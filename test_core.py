@@ -3,7 +3,14 @@ import sqlite3
 import tempfile
 import unittest
 
-from core import HistoryEntry, build_table_rows, chrome_timestamp_to_datetime, fetch_history
+from core import (
+    HistoryEntry,
+    build_table_rows,
+    chrome_timestamp_to_datetime,
+    display_date_only,
+    display_time_only,
+    fetch_history,
+)
 
 
 class CoreTests(unittest.TestCase):
@@ -44,8 +51,17 @@ class CoreTests(unittest.TestCase):
         rows = build_table_rows(
             [HistoryEntry(url="https://example.com", title="", visit_count=1, last_visit_time=0)]
         )
-        self.assertEqual(rows[0][0], "(no title)")
-        self.assertEqual(rows[0][3], "UNKNOWN")
+        self.assertEqual(rows[0][1], "(no title)")
+        self.assertEqual(rows[0][0], "UNKNOWN")
+        self.assertEqual(rows[0][2], "1")
+        self.assertEqual(rows[0][4], "UNKNOWN")
+        self.assertEqual(rows[0][5], "UNKNOWN")
+
+    def test_time_only_format(self) -> None:
+        self.assertEqual(display_time_only(0), "UNKNOWN")
+
+    def test_date_only_format(self) -> None:
+        self.assertEqual(display_date_only(0), "UNKNOWN")
 
 
 if __name__ == "__main__":
