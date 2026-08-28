@@ -6,7 +6,6 @@ import sqlite3
 import sys
 import tempfile
 from dataclasses import dataclass
-from functools import partial
 from typing import Iterable, List
 
 DEFAULT_HISTORY_FILE = (
@@ -96,13 +95,16 @@ class TitleLabel:  # runtime Qt subclass built in run_gui after Qt imports
 
 def run_gui(entries: List[HistoryEntry]) -> int:
     try:
-        from PyQt6.QtCore import Qt, pyqtSignal
+        from PyQt6.QtCore import QEvent, Qt
         from PyQt6.QtGui import QDesktopServices
         from PyQt6.QtWidgets import (
             QApplication,
             QHeaderView,
             QLabel,
             QMainWindow,
+            QStyledItemDelegate,
+            QStyle,
+            QStyleOptionViewItem,
             QTableWidget,
             QTableWidgetItem,
             QVBoxLayout,
@@ -112,13 +114,16 @@ def run_gui(entries: List[HistoryEntry]) -> int:
         pyqt6 = True
     except ImportError:
         try:
-            from PyQt5.QtCore import Qt, pyqtSignal, QUrl  # type: ignore
+            from PyQt5.QtCore import QEvent, Qt, QUrl  # type: ignore
             from PyQt5.QtGui import QDesktopServices  # type: ignore
             from PyQt5.QtWidgets import (  # type: ignore
                 QApplication,
                 QHeaderView,
                 QLabel,
                 QMainWindow,
+                QStyledItemDelegate,  # type: ignore
+                QStyle,  # type: ignore
+                QStyleOptionViewItem,  # type: ignore
                 QTableWidget,
                 QTableWidgetItem,
                 QVBoxLayout,
@@ -133,8 +138,6 @@ def run_gui(entries: List[HistoryEntry]) -> int:
         elide_right = Qt.TextElideMode.ElideRight
         text_word_wrap = Qt.TextFlag.TextWordWrap
         tooltip_role = Qt.ItemDataRole.ToolTipRole
-        pointer_cursor = Qt.CursorShape.PointingHandCursor
-        no_text_interaction = Qt.TextInteractionFlag.NoTextInteraction
         scroll_bar_off = Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         align_left = Qt.AlignmentFlag.AlignLeft
         align_vcenter = Qt.AlignmentFlag.AlignVCenter
@@ -148,8 +151,6 @@ def run_gui(entries: List[HistoryEntry]) -> int:
         elide_right = Qt.ElideRight
         text_word_wrap = Qt.TextWordWrap
         tooltip_role = Qt.ToolTipRole
-        pointer_cursor = Qt.PointingHandCursor
-        no_text_interaction = Qt.NoTextInteraction
         scroll_bar_off = Qt.ScrollBarAlwaysOff
         align_left = Qt.AlignLeft
         align_vcenter = Qt.AlignVCenter
@@ -160,39 +161,69 @@ def run_gui(entries: List[HistoryEntry]) -> int:
         resize_to_contents_mode = QHeaderView.ResizeToContents
         per_pixel_mode = QTableWidget.ScrollPerPixel
 
-    class ClickableTitleLabel(QLabel):
-        clicked = pyqtSignal()
+    url_role = Qt.ItemDataRole.UserRole if pyqt6 else Qt.UserRole
+    display_role = Qt.ItemDataRole.DisplayRole if pyqt6 else Qt.DisplayRole
 
-        def __init__(self, full_text: str):
-            super().__init__()
-            self.full_text = full_text
-            self.expanded = False
-            self.setToolTip(full_text)
-            self.setCursor(pointer_cursor)
-            self.setTextInteractionFlags(no_text_interaction)
-            self.setAlignment(align_left | align_vcenter)
-            self._render_text()
+    class TitleDelegate(QStyledItemDelegate):
+        expanded_row = -1
 
-        def set_expanded(self, expanded: bool) -> None:
-            self.expanded = expanded
-            self._render_text()
+        def _measure_wrap_height(self, font_metrics, text: str, width: int) -> int:
+            rect = font_metrics.boundingRect(
+                0, 0, width, 10000, text_word_wrap, text
+            )
+            return max(28, rect.height() + 10)
 
-        def _render_text(self) -> None:
-            if self.expanded:
-                self.setWordWrap(True)
-                self.setText(self.full_text)
-                return
-            self.setWordWrap(False)
-            text_width = max(10, self.width() - 8)
-            self.setText(self.fontMetrics().elidedText(self.full_text, elide_right, text_width))
+        def sizeHint(self, option, index):  # type: ignore[override]
+            size = super().sizeHint(option, index)
+            if index.row() == self.expanded_row:
+                text = index.data(display_role) or ""
+                width = max(40, self.parent().columnWidth(1) - 6)
+                size.setHeight(
+                    self._measure_wrap_height(option.fontMetrics, text, width)
+                )
+            return size
 
-        def resizeEvent(self, event) -> None:  # type: ignore[override]
-            super().resizeEvent(event)
-            self._render_text()
+        def paint(self, painter, option, index) -> None:  # type: ignore[override]
+            style_option = QStyleOptionViewItem(option)
+            self.initStyleOption(style_option, index)
+            text = index.data(display_role) or ""
 
-        def mousePressEvent(self, event) -> None:  # type: ignore[override]
-            self.clicked.emit()
-            super().mousePressEvent(event)
+            painter.save()
+            painter.setClipRect(option.rect)
+            if style_option.state & QStyle.StateFlag.State_Selected:
+                painter.fillRect(option.rect, style_option.palette.highlight())
+                painter.setPen(style_option.palette.highlightedText().color())
+            else:
+                painter.setPen(style_option.palette.text().color())
+
+            if index.row() == self.expanded_row:
+                painter.drawText(
+                    option.rect.adjusted(4, 3, -4, -3),
+                    align_left | align_vcenter | text_word_wrap,
+                    text,
+                )
+            else:
+                elided = style_option.fontMetrics.elidedText(
+                    text, elide_right, max(1, option.rect.width() - 8)
+                )
+                painter.drawText(
+                    option.rect.adjusted(4, 3, -4, -3),
+                    align_left | align_vcenter,
+                    elided,
+                )
+            painter.restore()
+
+        def editorEvent(self, event, model, option, index):  # type: ignore[override]
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and index.column() == 1
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                url = index.data(url_role)
+                if url:
+                    QDesktopServices.openUrl(QUrl(url))
+                return True
+            return super().editorEvent(event, model, option, index)
 
     class HistoryWindow(QMainWindow):
         collapsed_row_height = 28
@@ -228,6 +259,9 @@ def run_gui(entries: List[HistoryEntry]) -> int:
             layout.addWidget(self.table)
             self.setCentralWidget(root)
 
+            self.title_delegate = TitleDelegate(self.table)
+            self.table.setItemDelegateForColumn(1, self.title_delegate)
+
             self._populate_table()
             self._configure_columns()
             self._connect_signals()
@@ -241,10 +275,10 @@ def run_gui(entries: List[HistoryEntry]) -> int:
                 time_item.setData(tooltip_role, time_full)
                 self.table.setItem(row_idx, 0, time_item)
 
-                title_label = ClickableTitleLabel(title)
-                title_label.setToolTip(f"{title}\n{url}")
-                title_label.clicked.connect(partial(self._open_row_url, row_idx))
-                self.table.setCellWidget(row_idx, 1, title_label)
+                title_item = QTableWidgetItem(title)
+                title_item.setData(url_role, url)
+                title_item.setData(tooltip_role, f"{title}\n{url}" if url else title)
+                self.table.setItem(row_idx, 1, title_item)
 
                 count_item = QTableWidgetItem(visit_count)
                 self.table.setItem(row_idx, 2, count_item)
@@ -260,7 +294,6 @@ def run_gui(entries: List[HistoryEntry]) -> int:
 
         def _connect_signals(self) -> None:
             self.table.cellClicked.connect(self._toggle_row)
-            self.table.horizontalHeader().sectionResized.connect(self._on_column_resize)
             self.table.verticalScrollBar().valueChanged.connect(
                 lambda _: self._update_top_date_header()
             )
@@ -269,42 +302,29 @@ def run_gui(entries: List[HistoryEntry]) -> int:
             if row == self.expanded_row:
                 self._set_row_expanded(row, False)
                 self.expanded_row = -1
+                self.title_delegate.expanded_row = -1
                 return
 
             if self.expanded_row >= 0:
                 self._set_row_expanded(self.expanded_row, False)
             self.expanded_row = row
+            self.title_delegate.expanded_row = row
             self._set_row_expanded(row, True)
 
         def _set_row_expanded(self, row: int, expanded: bool) -> None:
-            title_label = self.table.cellWidget(row, 1)
-            if title_label is None:
-                return
-            title_label.set_expanded(expanded)
             if expanded:
-                column_width = max(40, self.table.columnWidth(1) - 14)
-                text = title_label.full_text
-                rect = title_label.fontMetrics().boundingRect(
-                    0, 0, column_width, 10000, text_word_wrap, text
+                column_width = max(40, self.table.columnWidth(1) - 6)
+                text = self.table.item(row, 1).text()
+                height = max(
+                    self.collapsed_row_height,
+                    self.title_delegate._measure_wrap_height(
+                        self.table.fontMetrics(), text, column_width
+                    ),
                 )
-                self.table.setRowHeight(row, max(self.collapsed_row_height, rect.height() + 12))
+                self.table.setRowHeight(row, height)
             else:
                 self.table.setRowHeight(row, self.collapsed_row_height)
-
-        def _on_column_resize(self, logical_index: int, *_args) -> None:
-            if logical_index != 1:
-                return
-            for row in range(self.table.rowCount()):
-                label = self.table.cellWidget(row, 1)
-                if label is not None:
-                    label._render_text()
-            if self.expanded_row >= 0:
-                self._set_row_expanded(self.expanded_row, True)
-
-        def _open_row_url(self, row: int) -> None:
-            url = self.entries[row].url
-            if url:
-                QDesktopServices.openUrl(QUrl(url))
+            self.table.viewport().update()
 
         def _update_top_date_header(self) -> None:
             row = self.table.rowAt(0)
@@ -330,6 +350,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=os.environ.get("BRAVE_HISTORY_FILE", DEFAULT_HISTORY_FILE),
         help="Path to the Brave History SQLite file.",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Profile the GUI under cProfile and print a sorted stats dump on exit.",
+    )
     return parser.parse_args(argv)
 
 
@@ -341,6 +366,18 @@ def main(argv: list[str] | None = None) -> int:
 
     entries = fetch_history(args.history_file)
     print(f"Loaded {len(entries)} history entries.")
+
+    if args.profile:
+        import cProfile
+        import pstats
+
+        profiler = cProfile.Profile()
+        profiler.enable()
+        code = run_gui(entries)
+        profiler.disable()
+        stats = pstats.Stats(profiler)
+        stats.sort_stats("cumulative").print_stats(30)
+        return code
     return run_gui(entries)
 
 
