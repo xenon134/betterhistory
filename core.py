@@ -82,14 +82,18 @@ def run_gui(entries: List[HistoryEntry]) -> int:
             QTableWidgetItem,
         )
     except ImportError:
-        from PyQt5.QtCore import Qt  # type: ignore
-        from PyQt5.QtWidgets import (  # type: ignore
-            QApplication,
-            QHeaderView,
-            QMainWindow,
-            QTableWidget,
-            QTableWidgetItem,
-        )
+        try:
+            from PyQt5.QtCore import Qt  # type: ignore
+            from PyQt5.QtWidgets import (  # type: ignore
+                QApplication,
+                QHeaderView,
+                QMainWindow,
+                QTableWidget,
+                QTableWidgetItem,
+            )
+        except ImportError:
+            print("PyQt is not installed. Install PyQt6 or PyQt5 and try again.")
+            return 1
 
     app = QApplication(sys.argv)
     window = QMainWindow()
